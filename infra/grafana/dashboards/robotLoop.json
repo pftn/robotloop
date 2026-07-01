@@ -1,0 +1,56 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "RobotLoop Data Pipeline",
+    "tags": [
+      "robotloop"
+    ],
+    "timezone": "browser",
+    "schemaVersion": 16,
+    "version": 0,
+    "panels": [
+      {
+        "type": "timeseries",
+        "title": "Upload Rate",
+        "gridPos": {
+          "x": 0,
+          "y": 0,
+          "w": 12,
+          "h": 8
+        },
+        "targets": [
+          {
+            "datasource": {
+              "type": "prometheus"
+            },
+            "expr": "rate(robotloop_uploads_total[1m])",
+            "legendFormat": "upload rate"
+          }
+        ]
+      },
+      {
+        "type": "stat",
+        "title": "Upload Success Rate",
+        "gridPos": {
+          "x": 0,
+          "y": 8,
+          "w": 6,
+          "h": 6
+        },
+        "targets": [
+          {
+            "datasource": {
+              "type": "prometheus"
+            },
+            "expr": "sum(robotloop_uploads_success) / (sum(robotloop_uploads_success) + sum(robotloop_uploads_failed)) * 100"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent"
+          }
+        }
+      }
+    ]
+  }
+}

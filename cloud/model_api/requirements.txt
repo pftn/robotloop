@@ -1,0 +1,6 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+torch>=2.0.0
+torchvision>=0.15.0
+Pillow>=10.0.0
+python-multipart>=0.0.6

@@ -1,0 +1,50 @@
+# prometheus.yml
+# SkyLoop 监控配置
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus 自身监控
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: [ 'localhost:9090' ]
+
+  # Flink JobManager 指标
+  - job_name: 'flink'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: [ 'flink-jobmanager:9249' ]
+        labels:
+          component: 'flink'
+
+  # SkyLoop API 服务（若暴露 /metrics）
+  - job_name: 'robotloop-api'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: [ 'api:8000' ]
+        labels:
+          component: 'api'
+
+  # Kafka Broker（通过 JMX Exporter 或 Kafka Exporter）
+  - job_name: 'kafka'
+    static_configs:
+      - targets: [ 'kafka-exporter:9308' ]
+        labels:
+          component: 'kafka'
+
+  # MinIO 对象存储
+  - job_name: 'minio'
+    metrics_path: '/minio/v2/metrics/cluster'
+    static_configs:
+      - targets: [ 'minio:9000' ]
+        labels:
+          component: 'minio'
+
+  # PostgreSQL（需要 postgres_exporter）
+  - job_name: 'postgres'
+    static_configs:
+      - targets: [ 'postgres-exporter:9187' ]
+        labels:
+          component: 'postgres'

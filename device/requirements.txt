@@ -1,0 +1,4 @@
+boto3>=1.28.0
+python-dotenv>=1.0.0
+kafka-python>=2.0.2
+Pillow>=10.0.0

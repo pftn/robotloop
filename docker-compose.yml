@@ -1,0 +1,382 @@
+#version: '3.8'
+
+networks:
+  robotloop-net:
+    driver: bridge
+
+volumes:
+  cassandra_data:
+
+services:
+  # ==================== 消息队列 ====================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - robotloop-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    networks:
+      - robotloop-net
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_started
+    entrypoint: >
+      /bin/bash -c "
+        echo 'Waiting for Kafka to be ready...';
+        cub kafka-ready -b kafka:9092 1 20;
+        echo 'Creating topics...';
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --topic file-upload-events --partitions 3 --replication-factor 1;
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --topic pre-label-tasks --partitions 3 --replication-factor 1;
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --topic human-review-tasks --partitions 3 --replication-factor 1;
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --topic alerts --partitions 3 --replication-factor 1;
+        echo 'Topics created successfully';
+        exit 0
+      "
+    networks:
+      - robotloop-net
+
+  # ==================== 对象存储 ====================
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - robotloop-net
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_started
+    volumes:
+      - ./infra/minio-init/init.sh:/init.sh
+    networks:
+      - robotloop-net
+    entrypoint: [ "/bin/sh", "/init.sh" ]
+
+  # ==================== 数据库 ====================
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: robotloop
+      POSTGRES_PASSWORD: robotloop
+      POSTGRES_DB: robotloop
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./cloud/storage/init-schema.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - robotloop-net
+
+  cassandra:
+    image: cassandra:4.1
+    environment:
+      - CASSANDRA_CLUSTER_NAME=RobotLoop
+    ports:
+      - "9042:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    networks:
+      - robotloop-net
+    healthcheck:
+      test: [ "CMD", "cqlsh", "-e", "describe keyspaces" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  cassandra-init:
+    image: cassandra:4.1
+    depends_on:
+      cassandra:
+        condition: service_healthy            # 等待 Cassandra 健康检查通过
+    entrypoint: >
+      /bin/bash -c "
+        until cqlsh cassandra -e 'DESCRIBE KEYSPACES'; do sleep 2; done;
+        cqlsh cassandra -e \"
+          CREATE KEYSPACE IF NOT EXISTS robotloop 
+          WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1};
+          USE robotloop;
+          CREATE TABLE IF NOT EXISTS robot_sensor_logs (
+            device_id text,
+            ts timestamp,
+            state_json text,
+            event text,
+            PRIMARY KEY ((device_id), ts)
+          ) WITH CLUSTERING ORDER BY (ts DESC);
+        \";
+        echo 'Cassandra init done';
+        exit 0
+      "
+    networks:
+      - robotloop-net
+
+  # ==================== Flink 集群 ====================
+  flink-jobmanager:
+    build: ./cloud/flink
+    hostname: flink-jobmanager
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.memory.heap.size: 1024m
+    ports:
+      - "8081:8081"
+    networks:
+      - robotloop-net
+
+  flink-taskmanager:
+    build: ./cloud/flink
+    hostname: flink-taskmanager
+    command: taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.memory.heap.size: 1024m
+        taskmanager.numberOfTaskSlots: 4
+    networks:
+      - robotloop-net
+
+  flink-job-submitter:
+    build: ./cloud/flink
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+      flink-taskmanager:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully   # 确保 topic 已创建
+      cassandra-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./cloud/flink/robot_stream_job.py:/opt/flink/job.py
+    command: >
+      bash -c "
+        echo 'Waiting for Flink JobManager REST API...';
+        while ! curl -s http://flink-jobmanager:8081/overview; do
+          sleep 2;
+        done;
+        echo 'Submitting job...';
+        /opt/flink/bin/flink run -m flink-jobmanager:8081 -py /opt/flink/job.py -d;
+        echo 'Job submitted';
+        exit 0
+      "
+    networks:
+      - robotloop-net
+
+  # ==================== API 服务 ====================
+  api:
+    build: ./cloud/api
+    ports:
+      - "8000:8000"
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      PG_HOST: postgres
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on:
+      minio:
+        condition: service_started
+      postgres:
+        condition: service_started
+      kafka:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully   # 发送消息前确保 topic 存在
+      cassandra-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./cloud/api:/app
+    networks:
+      - robotloop-net
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ==================== 模型推理服务 ====================
+  model-api:
+    build: ./cloud/model_api
+    ports:
+      - "9002:9002"
+    networks:
+      - robotloop-net
+
+  # ==================== 预标注服务 ====================
+  prelabel:
+    build: ./cloud/preprocessing
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      S3_ENDPOINT: http://minio:9000
+      PG_HOST: postgres
+      MODEL_API_URL: http://model-api:9002
+    depends_on:
+      kafka:
+        condition: service_started
+      minio:
+        condition: service_started
+      postgres:
+        condition: service_started
+      model-api:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully   # 确保 topic 已创建
+    volumes:
+      - ./cloud/preprocessing:/app
+    networks:
+      - robotloop-net
+
+  # ==================== 设备模拟器 ====================
+  device-simulator:
+    build: ./device
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      SIMULATE_NETWORK_ISSUES: "false"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./device:/app
+    networks:
+      - robotloop-net
+    command: sh /app/start.sh
+
+  # ==================== 开发者 CLI ====================
+  cli:
+    build: ./tools
+    environment:
+      API_URL: http://api:8000
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./tools:/app
+    networks:
+      - robotloop-net
+    entrypoint: python cli.py
+
+  # ==================== 监控 ====================
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - robotloop-net
+
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./infra/grafana/dashboards:/etc/grafana/dashboards
+    networks:
+      - robotloop-net
+
+  # ==================== 调度系统 ====================
+  redis:
+    image: redis:latest
+    networks:
+      - robotloop-net
+
+  airflow-init:
+    image: apache/airflow:2.9.2
+    depends_on:
+      postgres:
+        condition: service_started
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://robotloop:robotloop@postgres/airflow
+    entrypoint: >
+      /bin/bash -c "
+        echo 'Waiting for PostgreSQL...';
+        while ! pg_isready -h postgres -U robotloop; do sleep 2; done;
+        echo 'Creating airflow database if not exists...';
+        PGPASSWORD=robotloop psql -h postgres -U robotloop -d robotloop -tc \"SELECT 1 FROM pg_database WHERE datname='airflow'\" | grep -q 1 || \
+        PGPASSWORD=robotloop psql -h postgres -U robotloop -d robotloop -c 'CREATE DATABASE airflow;';
+        echo 'Initializing Airflow database...';
+        airflow db init;
+        echo 'Creating admin user...';
+        airflow users create --username admin --password admin --firstname Robot --lastname Loop --role Admin --email admin@robotloop.io;
+        echo 'Airflow initialization complete';
+        exit 0
+      "
+    networks:
+      - robotloop-net
+
+  airflow-webserver:
+    image: apache/airflow:2.9.2
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://robotloop:robotloop@postgres/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://robotloop:robotloop@postgres/airflow
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8080:8080"
+    command: webserver
+    networks:
+      - robotloop-net
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.2
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://robotloop:robotloop@postgres/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://robotloop:robotloop@postgres/airflow
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: scheduler
+    networks:
+      - robotloop-net
+
+  airflow-worker:
+    image: apache/airflow:2.9.2
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://robotloop:robotloop@postgres/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://robotloop:robotloop@postgres/airflow
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: celery worker
+    networks:
+      - robotloop-net

@@ -1,0 +1,15 @@
+# Airflow 核心依赖
+apache-airflow==2.9.2
+
+# 数据库与消息队列
+psycopg2-binary>=2.9.9
+redis>=4.5.0
+
+# Providers（可选，按需启用）
+apache-airflow-providers-celery>=3.0.0
+apache-airflow-providers-postgres>=5.0.0
+apache-airflow-providers-redis>=3.0.0
+
+# DAG 中可能用到的业务库
+kafka-python>=2.0.2
+boto3>=1.28.0
