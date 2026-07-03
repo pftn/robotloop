@@ -1,0 +1,70 @@
+#version: '3.8'
+
+networks:
+  retrieval-net:
+    name: robotloop_robotloop-net
+    external: true
+
+services:
+  # ---------- 搜索引擎 ----------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    hostname: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - retrieval-net
+
+  # ---------- 数据同步（一次性） ----------
+  sync:
+    build: .
+    environment:
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_USER=robotloop
+      - PG_PASSWORD=robotloop
+      - PG_DB=robotloop
+      - ES_HOST=http://elasticsearch:9200
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+      - S3_BUCKET=robotloop-data
+    volumes:
+      - chroma_data:/data/chroma # 持久化 Chroma 向量数据
+      - ./sync_to_retrieval:/app/sync_to_retrieval
+    depends_on:
+      - elasticsearch
+    networks:
+      - retrieval-net
+    entrypoint: python sync_to_retrieval.py
+
+  # ---------- 联合查询 API ----------
+  search-api:
+    build: .
+    environment:
+      - ES_HOST=http://elasticsearch:9200
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_USER=robotloop
+      - PG_PASSWORD=robotloop
+      - PG_DB=robotloop
+    volumes:
+      - chroma_data:/data/chroma          # 读取 Chroma 持久化数据
+    ports:
+      - "8001:8000"
+    depends_on:
+      - elasticsearch
+      - sync
+    networks:
+      - retrieval-net
+    command: uvicorn search_api:app --host 0.0.0.0 --port 8000
+
+volumes:
+  es_data:
+  chroma_data:
