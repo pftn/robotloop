@@ -1,14 +1,11 @@
-#version: '3.8'
+version: '3.8'
 
 networks:
   robotloop-net:
     driver: bridge
 
-volumes:
-  cassandra_data:
-
 services:
-  # ==================== 消息队列 ====================
+  # ---------- 基础设施 ----------
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     environment:
@@ -22,8 +19,8 @@ services:
     depends_on:
       - zookeeper
     environment:
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: ${KAFKA_ADVERTISED_LISTENERS:-PLAINTEXT://kafka:9092}
+      KAFKA_ZOOKEEPER_CONNECT: ${ZOOKEEPER_CONNECT:-zookeeper:2181}
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
@@ -35,227 +32,241 @@ services:
     depends_on:
       kafka:
         condition: service_started
+    environment:
+      KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP:-kafka:9092}
     entrypoint: >
       /bin/bash -c "
-        echo 'Waiting for Kafka to be ready...';
-        cub kafka-ready -b kafka:9092 1 20;
-        echo 'Creating topics...';
-        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --topic file-upload-events --partitions 3 --replication-factor 1;
-        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --topic pre-label-tasks --partitions 3 --replication-factor 1;
-        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --topic human-review-tasks --partitions 3 --replication-factor 1;
-        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --topic alerts --partitions 3 --replication-factor 1;
-        echo 'Topics created successfully';
+        echo 'Waiting for Kafka...';
+        cub kafka-ready -b $${KAFKA_BOOTSTRAP} 1 20;
+        kafka-topics --create --if-not-exists --bootstrap-server $${KAFKA_BOOTSTRAP} --topic raw-data-ingest --partitions 16 --replication-factor 1;
+        kafka-topics --create --if-not-exists --bootstrap-server $${KAFKA_BOOTSTRAP} --topic pre-label-tasks --partitions 3 --replication-factor 1;
+        kafka-topics --create --if-not-exists --bootstrap-server $${KAFKA_BOOTSTRAP} --topic human-review-tasks --partitions 3 --replication-factor 1;
+        kafka-topics --create --if-not-exists --bootstrap-server $${KAFKA_BOOTSTRAP} --topic alerts --partitions 3 --replication-factor 1;
+        echo 'Topics created';
         exit 0
       "
     networks:
       - robotloop-net
 
-  # ==================== 对象存储 ====================
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+      MINIO_NOTIFY_KAFKA_ENABLE_robotloop: "on"
+      MINIO_NOTIFY_KAFKA_BROKERS_robotloop: ${KAFKA_BOOTSTRAP:-kafka:9092}
+      MINIO_NOTIFY_KAFKA_TOPIC_robotloop: "raw-data-ingest"
+      MINIO_NOTIFY_KAFKA_TLS_robotloop: "off"
     ports:
       - "9000:9000"
       - "9001:9001"
     networks:
-      - robotloop-net
+      robotloop-net:
+        aliases:
+          - minio
+          - robotloop-data.minio
 
   minio-init:
     image: minio/mc
     depends_on:
       minio:
         condition: service_started
-    volumes:
-      - ./infra/minio-init/init.sh:/init.sh
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      MC_HOST_minio: http://${S3_ACCESS_KEY:-minioadmin}:${S3_SECRET_KEY:-minioadmin}@minio:9000
+      S3_BUCKET: ${S3_BUCKET:-robotloop-data}
     networks:
       - robotloop-net
-    entrypoint: [ "/bin/sh", "/init.sh" ]
+    entrypoint: >
+      /bin/sh -c "
+        sleep 15;
+        mc ready minio;
+        mc mb minio/$${S3_BUCKET} --ignore-existing;
+        mc mb minio/models --ignore-existing;
+        mc mb minio/iceberg-warehouse --ignore-existing;
+        echo 'Buckets created';
+        mc event add minio/$${S3_BUCKET} arn:minio:sqs::robotloop:kafka --event put --ignore-existing;
+        echo 'MinIO notification configured for data bucket only';
+        exit 0
+      "
 
-  # ==================== 数据库 ====================
-  postgres:
-    image: postgres:15
+  # ---------- 模型初始化 ----------
+  model-init:
+    build:
+      context: ./cloud/model_api
+      dockerfile: Dockerfile.model-init
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
     environment:
-      POSTGRES_USER: robotloop
-      POSTGRES_PASSWORD: robotloop
-      POSTGRES_DB: robotloop
-    ports:
-      - "5432:5432"
-    volumes:
-      - ./cloud/storage/init-schema.sql:/docker-entrypoint-initdb.d/init.sql
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
     networks:
       - robotloop-net
 
-  cassandra:
-    image: cassandra:4.1
-    environment:
-      - CASSANDRA_CLUSTER_NAME=RobotLoop
+  # ---------- Ray ----------
+  ray-head:
+    image: rayproject/ray:2.9.0-py310
+    container_name: ray-head
+    hostname: ray-head
+    shm_size: '2gb'
     ports:
-      - "9042:9042"
-    volumes:
-      - cassandra_data:/var/lib/cassandra
+      - "8265:8265" # Ray Dashboard
+      - "6379:6379" # Ray GCS (gRPC)
+      - "10001:10001" # Ray Client Server
+    command: bash -c "echo 'Starting Ray Head Node...' && ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265 --ray-client-server-port=10001 --num-cpus=0 --disable-usage-stats --block"
     networks:
       - robotloop-net
     healthcheck:
-      test: [ "CMD", "cqlsh", "-e", "describe keyspaces" ]
-      interval: 30s
+      test: [ "CMD", "bash", "-c", "ray status || exit 1" ]
+      interval: 5s
       timeout: 10s
-      retries: 5
+      retries: 10
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
 
-  cassandra-init:
-    image: cassandra:4.1
+  ray-worker:
+    build:
+      context: ./cloud/ray_worker
+      dockerfile: Dockerfile
+    container_name: ray-worker
+    hostname: ray-worker
     depends_on:
-      cassandra:
-        condition: service_healthy            # 等待 Cassandra 健康检查通过
-    entrypoint: >
-      /bin/bash -c "
-        until cqlsh cassandra -e 'DESCRIBE KEYSPACES'; do sleep 2; done;
-        cqlsh cassandra -e \"
-          CREATE KEYSPACE IF NOT EXISTS robotloop 
-          WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1};
-          USE robotloop;
-          CREATE TABLE IF NOT EXISTS robot_sensor_logs (
-            device_id text,
-            ts timestamp,
-            state_json text,
-            event text,
-            PRIMARY KEY ((device_id), ts)
-          ) WITH CLUSTERING ORDER BY (ts DESC);
-        \";
-        echo 'Cassandra init done';
-        exit 0
-      "
-    networks:
-      - robotloop-net
-
-  # ==================== Flink 集群 ====================
-  flink-jobmanager:
-    build: ./cloud/flink
-    hostname: flink-jobmanager
-    command: jobmanager
-    environment:
-      - |
-        FLINK_PROPERTIES=
-        jobmanager.rpc.address: flink-jobmanager
-        jobmanager.memory.heap.size: 1024m
-    ports:
-      - "8081:8081"
-    networks:
-      - robotloop-net
-
-  flink-taskmanager:
-    build: ./cloud/flink
-    hostname: flink-taskmanager
-    command: taskmanager
-    depends_on:
-      flink-jobmanager:
-        condition: service_started
-    environment:
-      - |
-        FLINK_PROPERTIES=
-        jobmanager.rpc.address: flink-jobmanager
-        taskmanager.memory.heap.size: 1024m
-        taskmanager.numberOfTaskSlots: 4
-    networks:
-      - robotloop-net
-
-  flink-job-submitter:
-    build: ./cloud/flink
-    depends_on:
-      flink-jobmanager:
-        condition: service_started
-      flink-taskmanager:
-        condition: service_started
-      kafka-init:
-        condition: service_completed_successfully   # 确保 topic 已创建
-      cassandra-init:
+      ray-head:
+        condition: service_healthy
+      model-init:
         condition: service_completed_successfully
+      model-api:
+        condition: service_healthy
+    environment:
+      # Kafka
+      - KAFKA_BOOTSTRAP=${KAFKA_BOOTSTRAP:-kafka:9092}
+      # S3 / MinIO
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - S3_BUCKET=${S3_BUCKET:-robotloop-data}
+      # Milvus
+      - MILVUS_URI=${MILVUS_URI}
+      - MILVUS_TOKEN=${MILVUS_TOKEN}
+      # Model API
+      - MODEL_API_URL=${MODEL_API_URL:-http://model-api:9002}
+      # LanceDB
+      - LANCE_PATH=${LANCE_PATH:-/tmp/lance}
+      # Iceberg
+      - ICEBERG_WAREHOUSE=s3://iceberg-warehouse
+      - ICEBERG_TABLE=${ICEBERG_TABLE:-robotloop.scenes_meta}
+      - ICEBERG_CATALOG_URI=${ICEBERG_CATALOG_URI:-http://iceberg-rest:8181}
+      # Model cache
+      - MODEL_CACHE_DIR=/tmp/models
+    shm_size: '4gb'
+    user: "0:0"
     volumes:
-      - ./cloud/flink/robot_stream_job.py:/opt/flink/job.py
-    command: >
-      bash -c "
-        echo 'Waiting for Flink JobManager REST API...';
-        while ! curl -s http://flink-jobmanager:8081/overview; do
-          sleep 2;
-        done;
-        echo 'Submitting job...';
-        /opt/flink/bin/flink run -m flink-jobmanager:8081 -py /opt/flink/job.py -d;
-        echo 'Job submitted';
-        exit 0
-      "
+      - ./cloud/ray_worker:/app
+      - lance_data:/tmp/lance
     networks:
       - robotloop-net
 
-  # ==================== API 服务 ====================
+  # ---------- Iceberg REST Catalog ----------
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.5.0
+    container_name: iceberg-rest
+    ports:
+      - "8181:8181"
+    environment:
+      - CATALOG_WAREHOUSE=s3://iceberg-warehouse
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - CATALOG_S3_ACCESS_KEY_ID=${S3_ACCESS_KEY:-minioadmin}
+      - CATALOG_S3_SECRET_ACCESS_KEY=${S3_SECRET_KEY:-minioadmin}
+      - CATALOG_S3_REGION=us-east-1
+      # ↓↓↓ 双下划线格式（根据 GitHub issue #7709）↓↓↓
+      - CATALOG_S3_PATH__STYLE__ACCESS=true
+      # 同时保留单下划线作为备用
+      - CATALOG_S3_PATH_STYLE_ACCESS=true
+      # AWS 环境变量
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=${S3_ACCESS_KEY:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${S3_SECRET_KEY:-minioadmin}
+    networks:
+      - robotloop-net
+    depends_on:
+      - minio-init
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8181/v1/config" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ---------- 模型 API ----------
+  model-api:
+    build: ./cloud/model_api
+    ports:
+      - "9002:9002"
+    environment:
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - MODEL_CACHE_DIR=/tmp/models
+    volumes:
+      - ./cloud/model_api:/app
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9002/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - robotloop-net
+    command: uvicorn model_api:app --host 0.0.0.0 --port 9002
+
+  # ---------- 检索 API ----------
   api:
     build: ./cloud/api
     ports:
       - "8000:8000"
     environment:
-      S3_ENDPOINT: http://minio:9000
-      PG_HOST: postgres
-      KAFKA_BOOTSTRAP: kafka:9092
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - MILVUS_URI=${MILVUS_URI}
+      - MILVUS_TOKEN=${MILVUS_TOKEN}
+      - LANCE_PATH=${LANCE_PATH:-/tmp/lance}
+      - MODEL_CACHE_DIR=/tmp/models
+    volumes:
+      - ./cloud/api:/app
+      - lance_data:/tmp/lance
     depends_on:
       minio:
         condition: service_started
-      postgres:
-        condition: service_started
       kafka:
         condition: service_started
-      kafka-init:
-        condition: service_completed_successfully   # 发送消息前确保 topic 存在
-      cassandra-init:
+      model-init:
         condition: service_completed_successfully
-    volumes:
-      - ./cloud/api:/app
     networks:
       - robotloop-net
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
-  # ==================== 模型推理服务 ====================
-  model-api:
-    build: ./cloud/model_api
-    ports:
-      - "9002:9002"
-    networks:
-      - robotloop-net
-
-  # ==================== 预标注服务 ====================
-  prelabel:
-    build: ./cloud/preprocessing
-    environment:
-      KAFKA_BOOTSTRAP: kafka:9092
-      S3_ENDPOINT: http://minio:9000
-      PG_HOST: postgres
-      MODEL_API_URL: http://model-api:9002
-    depends_on:
-      kafka:
-        condition: service_started
-      minio:
-        condition: service_started
-      postgres:
-        condition: service_started
-      model-api:
-        condition: service_started
-      kafka-init:
-        condition: service_completed_successfully   # 确保 topic 已创建
-    volumes:
-      - ./cloud/preprocessing:/app
-    networks:
-      - robotloop-net
-
-  # ==================== 设备模拟器 ====================
+  # ---------- 设备模拟器 ----------
   device-simulator:
     build: ./device
     environment:
-      S3_ENDPOINT: http://minio:9000
-      SIMULATE_NETWORK_ISSUES: "false"
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - S3_BUCKET=${S3_BUCKET:-robotloop-data}
+      - SIMULATE_NETWORK_ISSUES=${SIMULATE_NETWORK_ISSUES:-false}
     depends_on:
       minio-init:
-        condition: service_completed_successfully
-      kafka-init:
         condition: service_completed_successfully
     volumes:
       - ./device:/app
@@ -263,20 +274,32 @@ services:
       - robotloop-net
     command: sh /app/start.sh
 
-  # ==================== 开发者 CLI ====================
-  cli:
-    build: ./tools
+  # ---------- Jupyter ----------
+  jupyter:
+    build: ./jupyter
+    ports:
+      - "8888:8888"
     environment:
-      API_URL: http://api:8000
-    stdin_open: true
-    tty: true
+      - JUPYTER_ENABLE_LAB=yes
+      - GRANT_SUDO=yes
+      - MILVUS_URI=${MILVUS_URI}
+      - MILVUS_TOKEN=${MILVUS_TOKEN}
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - LANCE_PATH=${LANCE_PATH:-/tmp/lance}
+      - MODEL_CACHE_DIR=/tmp/models
     volumes:
-      - ./tools:/app
+      - ./jupyter/demo.ipynb:/home/jovyan/work/demo.ipynb
+      - lance_data:/tmp/lance
+    depends_on:
+      - minio
+      - api
     networks:
       - robotloop-net
-    entrypoint: python cli.py
+    command: start-notebook.sh --NotebookApp.token=''
 
-  # ==================== 监控 ====================
+  # ---------- 监控 ----------
   prometheus:
     image: prom/prometheus
     volumes:
@@ -295,88 +318,5 @@ services:
     networks:
       - robotloop-net
 
-  # ==================== 调度系统 ====================
-  redis:
-    image: redis:latest
-    networks:
-      - robotloop-net
-
-  airflow-init:
-    image: apache/airflow:2.9.2
-    depends_on:
-      postgres:
-        condition: service_started
-    environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://robotloop:robotloop@postgres/airflow
-    entrypoint: >
-      /bin/bash -c "
-        echo 'Waiting for PostgreSQL...';
-        while ! pg_isready -h postgres -U robotloop; do sleep 2; done;
-        echo 'Creating airflow database if not exists...';
-        PGPASSWORD=robotloop psql -h postgres -U robotloop -d robotloop -tc \"SELECT 1 FROM pg_database WHERE datname='airflow'\" | grep -q 1 || \
-        PGPASSWORD=robotloop psql -h postgres -U robotloop -d robotloop -c 'CREATE DATABASE airflow;';
-        echo 'Initializing Airflow database...';
-        airflow db init;
-        echo 'Creating admin user...';
-        airflow users create --username admin --password admin --firstname Robot --lastname Loop --role Admin --email admin@robotloop.io;
-        echo 'Airflow initialization complete';
-        exit 0
-      "
-    networks:
-      - robotloop-net
-
-  airflow-webserver:
-    image: apache/airflow:2.9.2
-    depends_on:
-      airflow-init:
-        condition: service_completed_successfully
-    environment:
-      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://robotloop:robotloop@postgres/airflow
-      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
-      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://robotloop:robotloop@postgres/airflow
-    volumes:
-      - ./airflow/dags:/opt/airflow/dags
-      - ./airflow/plugins:/opt/airflow/plugins
-      - /var/run/docker.sock:/var/run/docker.sock
-    ports:
-      - "8080:8080"
-    command: webserver
-    networks:
-      - robotloop-net
-
-  airflow-scheduler:
-    image: apache/airflow:2.9.2
-    depends_on:
-      airflow-init:
-        condition: service_completed_successfully
-    environment:
-      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://robotloop:robotloop@postgres/airflow
-      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
-      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://robotloop:robotloop@postgres/airflow
-    volumes:
-      - ./airflow/dags:/opt/airflow/dags
-      - ./airflow/plugins:/opt/airflow/plugins
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: scheduler
-    networks:
-      - robotloop-net
-
-  airflow-worker:
-    image: apache/airflow:2.9.2
-    depends_on:
-      airflow-init:
-        condition: service_completed_successfully
-    environment:
-      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://robotloop:robotloop@postgres/airflow
-      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
-      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://robotloop:robotloop@postgres/airflow
-    volumes:
-      - ./airflow/dags:/opt/airflow/dags
-      - ./airflow/plugins:/opt/airflow/plugins
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: celery worker
-    networks:
-      - robotloop-net
+volumes:
+  lance_data:

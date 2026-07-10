@@ -1,0 +1,5 @@
+FROM python:3.10-slim
+RUN pip install --no-cache-dir boto3 torch torchvision sentence-transformers
+ENV HF_ENDPOINT=https://hf-mirror.com
+COPY init_model.py /init_model.py
+CMD ["python", "/init_model.py"]

@@ -1,11 +1,6 @@
 #!/bin/sh
-echo "========== 开始生成数据 =========="
+echo "========== Generating robot data =========="
 python generator.py
-echo "生成脚本退出码: $?"
-
-echo "========== 开始上传数据 =========="
+echo "========== Uploading data to MinIO =========="
 python uploader.py
-echo "上传脚本退出码: $?"
-
-echo "========== 全部完成 =========="
-tail -f /dev/null
+echo "========== Done =========="

@@ -1,0 +1,21 @@
+# ⚠️ 关键约束：
+# 1. setuptools >= 82.0.0 移除了 pkg_resources，必须 <= 80.10.2
+# 2. click >= 8.3.0 的 deepcopy 与 Python 3.10 enum 不兼容，必须 <= 8.2.1
+
+setuptools<=80.10.2
+click<=8.2.1
+wheel>=0.40.0
+
+# 业务依赖
+kafka-python==2.0.2
+boto3==1.28.0
+pymilvus>=2.4.0
+lancedb>=0.8.0
+pyarrow>=15.0.0 
+requests==2.31.0
+Pillow==10.0.0
+torch>=2.1.0
+sentence-transformers>=5.0
+pyiceberg[pyiceberg-core]>=0.6.0
+numpy==1.26.4
+scipy==1.11.4

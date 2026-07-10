@@ -2,7 +2,7 @@
 
 # 默认目标
 help:
-	@echo "SkyLoop 数据闭环平台 Demo"
+	@echo "RobotLoop 机器人多模态数据闭环平台 Demo"
 	@echo ""
 	@echo "可用命令:"
 	@echo "  make up         启动所有服务"
