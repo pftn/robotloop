@@ -1,288 +1,239 @@
-# RobotLoop — 机器人多模态数据闭环平台（技术验证原型）
+# RobotLoop — 具身智能数据闭环平台
 
-RobotLoop 是一个面向 **具身智能/机器人** 的数据飞轮系统技术验证原型，集成 **混合语义检索** 与 **列式特征存储**。项目覆盖设备端模拟数据生成、对象存储事件驱动、Ray 统一调度、文本向量化、Lance 列式数据湖、Zilliz Cloud 向量库以及检索 API，形成从数据采集到特征存储的闭环验证。
+从设备数据（MCAP/rosbag2）进来，到 LeRobot 训练格式出去——中间是统一数据模型、
+数据湖、混合检索与质检的一条完整链路。
 
-## 本 Demo 展示
+> 📹 **自采 MCAP → 数据湖 → 导出 → ACT 训练 → aloha 仿真评测**，全链路实测录屏：
+> [docs/assets/eval_aloha.mp4](docs/assets/eval_aloha.mp4)（20K 步训练的 policy 在
+> gym_aloha 仿真中执行 rollout；数字见[训练闭环](#训练闭环autodl-4090)一节）
 
-- **设备端模拟生成**多模态场景元数据（位姿、IMU、图像路径、ROS Bag 引用）
-- **MinIO 对象存储**自动触发 Kafka 事件，驱动 Ray 数据处理流水线
-- **Ray Core** 实现元数据下载、HTTP 标注、CLIP 文本向量化、模拟轨迹编码
-- **LanceDB** 列式追加写入（结构化元数据 + 特征向量）
-- **Zilliz Cloud** 存储文本向量并提供语义检索
-- **Iceberg** 同步结构化元数据（企业数仓/BI 兼容）
-- **混合检索 API**：结构化条件（场景类型、质量分）+ 语义向量
-- **Jupyter** 交互式演示环境
-- **Prometheus + Grafana** 监控链路
+## 为什么做
 
-> **注意**：本原型在单台 64GB PC 上运行，部分高级功能（GPU 视频解码、SAM 语义分割、VLM 场景描述、图像 CLIP 编码、PointNet 点云处理）为架构设计目标，当前版本使用模拟数据或 HTTP Mock 验证链路。
+具身数据链路是断的：采集侧是 ROS bag，训练侧要 LeRobot/RLDS，中间缺少统一的
+数据模型和基础设施。LeRobot 生态 v2.1/v3.0 双版本并存、下游框架各自站队，
+格式转换是真实痛点。而数据质量决定模型上限，"出厂检验"在开源生态里几乎没人做。
 
-## 架构图
+## 架构
 
 ```mermaid
 graph LR
-    subgraph Device["设备端（模拟）"]
-        Gen["数据生成器
-(scene_metadata.json + 图像帧)"] --> Uploader["上传组件
-(仅 MinIO 上传)"]
+    subgraph Device["设备端"]
+        Sim["场景模拟器"] --> Up1["uploader.py"]
+        Bags["真实采集<br/>.mcap / .bag"] --> Up2["upload_mcap.py"]
     end
 
-    subgraph Infra["基础设施"]
-        MinIO["MinIO
-对象存储/模型仓库"]
-        Kafka["Kafka
-(MinIO 通知触发)"]
-        ZK["Zookeeper"]
-        KafkaInit["Kafka Init"]
-        MinIOInit["MinIO Init + 通知配置"]
-        Zilliz["Zilliz Cloud
-(Milvus)"]
+    subgraph Infra["事件驱动基础设施"]
+        MinIO["MinIO 对象存储"]
+        Kafka["Kafka"]
     end
 
-    subgraph Compute["计算与处理 (Ray 本地模拟)"]
-        RayHead["Ray Head"]
-        RayWorker["Ray Worker
-(消费 Kafka, 运行 Task)"]
+    subgraph Pipeline["Ray 流水线"]
+        Worker["解析对齐 → 质检 → 向量化<br/>（按扩展名注册表分流）"]
     end
 
-    subgraph Services["业务服务"]
-        API["REST API
-(混合检索)"]
-        ModelAPI["模型 API
-(模拟目标检测/场景标注)"]
-        Jupyter["Jupyter
-(交互式演示)"]
+    subgraph Storage["存储分层"]
+        Iceberg[("Iceberg episodes 表<br/>元数据 + 帧指针")]
+        Frames[("MinIO frames/<br/>帧 Parquet")]
+        Vector[("Zilliz / LanceDB<br/>向量索引")]
     end
 
-    subgraph Storage["数据湖 & 特征存储"]
-        Lance[("LanceDB
-(结构化元数据 + 特征向量)")]
-        Iceberg[("Apache Iceberg
-(结构化元数据)")]
+    subgraph Serving["服务"]
+        API["混合检索 API"]
+        NB["Jupyter 演示"]
+        Export["LeRobot 导出"]
     end
 
-    subgraph Monitor["监控"]
-        Prom["Prometheus"]
-        Grafana["Grafana"]
+    subgraph Train["训练闭环"]
+        ACT["AutoDL 4090<br/>ACT 训练 + aloha 仿真评测"]
     end
 
-    Uploader -- " 原始文件 " --> MinIO
-    MinIOInit --> MinIO
-    MinIO -- " 上传事件 " --> Kafka
-    KafkaInit --> Kafka
-    Kafka -- " 消息 " --> RayWorker
-    RayWorker -- " Ray Task " --> RayHead
-    RayHead --> RayWorker
-    RayWorker -- " 调用标注 " --> ModelAPI
-    RayWorker -- " 写入向量 " --> Zilliz
-    RayWorker -- " 追加列 " --> Lance
-    RayWorker -- " 同步结构化数据 " --> Iceberg
-    API -- " 向量检索 " --> Zilliz
-    API -- " 结构化过滤 " --> Lance
-    Jupyter -- " 调用 " --> API
-    Jupyter -- " 直连 " --> MinIO
-    Jupyter -- " 直连 " --> Lance
-    Jupyter -- " 直连 " --> Zilliz
-    Prom --> RayHead
-    Prom --> MinIO
-    Prom --> Kafka
-    Grafana --> Prom
+    Up1 --> MinIO
+    Up2 --> MinIO
+    MinIO --> Kafka --> Worker
+    Worker --> Iceberg
+    Worker --> Frames
+    Worker --> Vector
+    Iceberg --> API
+    Vector --> API
+    API --> NB
+    Iceberg --> Export
+    Frames --> Export
+    Export --> ACT
 ```
 
-> **架构说明**：
-> - **设备端**：生成 `scene_metadata.json`（包含场景描述、类型、质量分等）及模拟图像帧，上传至 MinIO；不直接依赖 Kafka。
-> - **事件驱动**：MinIO 通过 Bucket 通知将 `put` 事件推送至 Kafka `raw-data-ingest`。
-> - **计算层**：Ray Worker（本地单节点模拟）消费 Kafka 事件，执行 Download → Annotate → Embedding → WriteOut Task，写入 Lance、Zilliz Cloud、Iceberg。
-> - **存储**：LanceDB 存储结构化元数据 + 特征向量；Iceberg 同步结构化元数据；Zilliz Cloud 提供向量检索。
-> - **检索**：REST API 接收结构化条件 + 语义向量，查询 Zilliz Cloud 获得候选 ID，再通过 Lance 精确过滤排序。
-> - **演示**：Jupyter 容器可直接访问内部服务，运行 Notebook 体验数据浏览、混合搜索。
-> - **模型管理**：CLIP 模型权重通过 MinIO 版本化管理，Ray Worker 启动时下载并缓存。
+## 核心能力
 
-## 项目结构
+- **统一 Episode 数据模型** —— 轨迹级元数据进 Iceberg，帧数据按 LeRobot v3
+  文件块思路落 Parquet，检索、过滤、训练导出共用同一模型
+- **真实数据入口** —— MCAP/rosbag2 解析（纯 Python，零 ROS 依赖），
+  相机帧锚点 + 关节流多速率时间戳对齐，对齐质量出报告
+- **混合检索** —— CLIP 语义向量 × Iceberg 结构化过滤联合命中：
+  「ALOHA 双臂成功抓取红色方块的相似轨迹」一条 query 同时用上两侧
+- **数据质检流水线** —— 失败轨迹过滤 / 频率异常检测 / 相似度去重 /
+  任务分布统计，接入 Ray 流水线在入库前自动执行，剔除原因可解释
+- **lerobot-convert** —— LeRobot v2.1 ↔ v3.0 批量互转 + 校验的独立工具库，
+  `pip install` 即用（[lerobot-convert/](lerobot-convert/)）
+- **训练闭环** —— 按条件从数据湖导出 LeRobot 格式（图像特征 + 归一化统计
+  齐备，训练前一键校验），AutoDL 4090 上 ACT 训练 + aloha 仿真评测
 
-```text
-robotloop/
-├── README.md                        # 项目说明
-├── Makefile                         # 构建脚本
-├── docker-compose.yml               # 核心服务编排
-├── .env.example                     # 环境变量模板
-├── device/                          # 设备端模拟
-│   ├── Dockerfile
-│   ├── generator.py                 # 生成多模态场景元数据及图像帧
-│   ├── uploader.py                  # 上传文件至 MinIO
-│   ├── start.sh                     # 启动脚本
-│   ├── sample.jpg                   # 样本图像
-│   └── requirements.txt
-├── cloud/                           # 云端服务
-│   ├── ray_worker/                  # Ray 数据处理
-│   │   ├── Dockerfile
-│   │   ├── entrypoint.sh            # Worker 启动脚本
-│   │   ├── ray_pipeline.py          # Ray Task：消费 Kafka, 处理场景, 写入存储
-│   │   └── requirements.txt
-│   ├── api/                         # 混合检索 REST API
-│   │   ├── Dockerfile
-│   │   ├── main.py                  # FastAPI，Zilliz Cloud + Lance 检索
-│   │   └── requirements.txt
-│   └── model_api/                   # 模型推理服务（模拟）
-│       ├── Dockerfile
-│       ├── Dockerfile.model-init      # 模型初始化镜像
-│       ├── model_api.py             # 模拟目标检测 + 场景标注
-│       ├── init_model.py            # 下载模型并上传至 MinIO
-│       └── requirements.txt
-├── jupyter/                         # 交互式演示
-│   ├── Dockerfile
-│   ├── demo.ipynb                   # 全流程演示 Notebook
-│   └── requirements.txt
-├── infra/                           # 基础设施配置
-│   ├── prometheus/
-│   │   └── prometheus.yml
-│   └── grafana/
-│       └── dashboards/
-│           └── robotLoop.json
-└── tests/                           # 测试（预留）
-```
+## RLDS ↔ LeRobot ↔ RobotLoop 概念映射
+
+三套生态用三套词汇描述同一件事。Episode/Step 模型是它们的公共超集
+（`is_first/is_last/is_terminal`、`language_instruction` 字段命名对齐）——
+这张表是理解整个领域模型的钥匙：
+
+| 概念 | RLDS（TFDS/Open X） | LeRobot（HF） | RobotLoop | 备注 |
+|---|---|---|---|---|
+| 数据集 | TFDS DatasetBuilder | LeRobotDataset（HF repo） | Iceberg namespace + MinIO frames/ | `episodes.dataset_name` 记录来源 |
+| 一条轨迹 | Episode | 一个 episode | `episodes` 表一行 | 主键 `episode_id` |
+| 一帧 | Step | 一帧（data 一行） | `frames/{episode_id}.parquet` 中一行 | `frame_index` 三边一致 |
+| 任务/语言指令 | `language_instruction` | `meta/tasks` + 帧级 `task_index` | `episodes.task` + `language_instruction` | 文本是 CLIP 语义检索的编码对象 |
+| 观测 | `observation`（嵌套 dict） | `observation.state` / `observation.images.*` | 帧 parquet 的 `state` + `image_paths` | 图像落对象存储，只存路径 |
+| 动作 | `action` | `action` 列 | 帧 parquet `action`（list\<double\>） | 维度语义放 modality.json 元数据，不写死 schema |
+| 奖励 | `reward` | 无标准字段 | 帧 parquet `reward`（可空） | LeRobot 面向模仿学习 |
+| 终止标记 | `is_terminal` / `is_last` / `is_first` | episode 边界 + frame_index | 帧 parquet 三者齐全（超集） | 导出时按边界推导 |
+| 成功标记 | 无标准 | 无标准 | `episodes.success`（bool，可空） | 失败过滤的第一字段 |
+| 机器人本体 | 隐含在元信息 | `info.json` 的 `robot_type` | `episodes.embodiment_tag` + `robot_type` | 与 GR00T embodiment tag / Open X 命名对齐 |
+| 采集来源 | 无 | 无 | `episodes.source`（teleop \| sim \| real） | 区分遥操作/仿真/真机自主 |
+| 时间基准 | step 序号 | `timestamp` 列 | 帧 parquet `timestamp`（对齐后统一时刻） | 多 topic 原始时间戳入库前对齐 |
+| 格式版本 | TFDS version | `codebase_version`（v2.1 / v3.0） | —（convert 层双版本兼容） | π0/OpenPI 要 v2.1；新工具链要 v3.0 |
+
+## 设计决策
+
+- **存储分层：元数据与帧数据分离。** 帧数据一 episode 一 Parquet（对齐
+  LeRobot v3 文件块设计），Iceberg 仅存元数据与指针，避免小文件问题，
+  Parquet row group 天然支持帧级随机读。
+- **解析层零 ROS 依赖。** 基于 `rosbags` 纯 Python 实现，云端 / CI /
+  客户环境部署无需 ROS2 运行时。
+- **范围决策：Open X（RLDS）支持单向导入**，导出聚焦 LeRobot 生态
+  （事实标准，覆盖 π0/GR00T 训练链路）。
+- **闭环验证双轨：自采 aloha 全链路为主，ACT × PushT 为回归验证基线。**
+  自采 14 维 MCAP 与 gym_aloha 观测空间天然对齐（/top、480×640），
+  训练后可做仿真评测；PushT 低成本、小时级可复现，用于管线回归。
+  GR00T/OpenVLA 接入已预留 modality.json 生成与脚本模板
+  （见 `robotloop/export/gr00t.py`）。
+- **Zilliz 免费版先灌子集验证**（运维细节见 [docs/](docs/)）。
 
 ## 快速开始
 
-### 1. 前置条件
-
-- Docker & Docker Compose (v2.0+)
-- 至少 8 GB 可用内存（推荐 16 GB）
-- Zilliz Cloud 账号（免费试用即可），获取 `MILVUS_URI` 和 `MILVUS_TOKEN`
-
-### 2. 配置环境变量
-
 ```bash
-cp .env.example .env
-# 编辑 .env，修改 MILVUS_URI 和 MILVUS_TOKEN
+cp .env.example .env          # 填入 MILVUS_URI / MILVUS_TOKEN（Zilliz 免费版）
+docker compose up -d          # MinIO / Kafka / Ray / Iceberg REST / API / Grafana
 ```
 
-### 3. 启动所有服务
+启动后 device-simulator 自动完成全链路：生成示例 MCAP 包（合成 30Hz 相机 +
+500Hz 关节流，8 秒 pick 轨迹）→ 上传到原始数据 bucket `robotloop-raw` →
+bucket notification 发 Kafka → Ray 按扩展名分流解析入库。直接看日志：
 
 ```bash
-docker compose up -d
+docker compose logs -f ray-worker   # 解析→质检→向量化→写库
 ```
 
-首次启动会自动：
-- 初始化 Kafka topics
-- 创建 MinIO buckets（robotloop-data, models, iceberg-warehouse）并配置 Kafka 通知
-- 下载模型权重并上传至 MinIO（`model-init`）
-- 启动 Ray 集群、模型 API、检索 API、设备模拟器
-- 设备模拟器生成 1000 条场景数据并上传至 MinIO
+真实采集的 `.mcap` 放到 `device/sample_bags/` 后手动触发一次即可：
+`docker compose exec device-simulator python /app/upload_mcap.py --dir /app/sample_bags --embodiment <本体> --task <任务> --instruction "<指令>" --source teleop --success true`
 
-等待所有容器健康运行（约 2-3 分钟）：
+本地开发（无 Docker）：
+
 ```bash
-docker compose ps
+pip install -r requirements-pipeline.txt
+pytest tests/ -q                                    # 76 个用例
+robotloop ingest-demo --store ./lake -n 60          # 合成数据灌库
+robotloop search --store ./lake --query "找所有 ALOHA 双臂成功抓取红色方块的轨迹"
+robotloop export --store ./lake --out ./ft_data --version v2.1 \
+  --filters '{"embodiment_tag": "aloha", "source": "sim"}' --fps 10.0
+robotloop finetune-script --dataset ./ft_data --env aloha --out ./run_act.sh
 ```
 
-### 4. 触发数据处理流水线
+公开数据集灌库（数据集清单 / size preflight / 验收）：[docs/datasets.md](docs/datasets.md)。
 
-设备模拟器上传文件后，MinIO 自动发送事件到 Kafka，Ray Worker 自动消费并执行处理 Task，将结果写入 Lance、Zilliz Cloud、Iceberg。
+## 训练闭环（AutoDL 4090）
 
-检查 Ray Worker 日志：
+自采 MCAP → 平台灌库 → 检索过滤 → 导出 → ACT 训练 + aloha 仿真评测，
+**全链路已在 AutoDL 4090 上实测完成**。
+
+**一条龙脚本**（造包 → 上传 → 等灌库 → 导出 → 拷出 → 训练前校验）：
+
 ```bash
-docker compose logs -f ray-worker
+bash scripts/make_aloha_dataset.sh 5     # 5 条 aloha 包：/top 480x640 + 14 维
 ```
 
-### 5. 访问各组件
+![数据准备与导出全流程](docs/assets/make_dataset_log.png)
 
-- Ray Dashboard: `http://localhost:8265`
-- MinIO Console: `http://localhost:9001` (minioadmin / minioadmin)
-- Jupyter Notebook: `http://localhost:8888` (无密码)
-- API 文档 (Swagger): `http://localhost:8000/docs`
-- Prometheus: `http://localhost:9090`
-- Grafana: `http://localhost:3000` (admin / admin)
+**训练前校验**——模拟 lerobot v0.3.3 加载端全项检查（占位符 / ACT 图像
+特征 / stats 五件套 / 时间戳容差 / 帧数一致 / env 键名对齐），
+校验不通过则不进入训练阶段：
 
-### 6. Jupyter 演示
+```bash
+python3 scripts/verify_lerobot_dataset.py ./ft_mcap --expect-env aloha
+```
 
-打开 `http://localhost:8888`，进入 `work` 目录，打开 `demo.ipynb` 体验全流程。
+上卡训练（`run_act.sh` 由 `robotloop finetune-script` 生成）：
 
-## 模块说明
+```bash
+scp -r ./ft_mcap root@<AutoDL-IP>:/root/lerobot/data/ft_mcap
+DATASET=/root/lerobot/data/ft_mcap bash run_act.sh
+```
 
-### 设备端模拟器（device）
+### 实测结果（5 episodes / 1050 frames，20K 步，42 分钟）
 
-- **generator.py**：生成 `scene_metadata.json`（包含 1000 个场景的结构化元数据）和多个模拟图像帧（复制 sample.jpg），存储在 `/tmp/robot_data`。
-- **uploader.py**：将 `/tmp/robot_data` 下所有文件上传至 MinIO `robotloop-data` bucket，**不依赖 Kafka**。上传完成后 MinIO 自动发送事件。
+| 指标 | 数值 |
+|---|---|
+| 训练 loss（加权） | 5.54 → 0.06（20K 步） |
+| l1_loss（wandb） | 0.68 → 0.05 |
+| 梯度范数 | 142 → 9.4 |
+| 仿真评测 | 4 个节点（5K/10K/15K/20K）各 rollout 一次，录屏见 [docs/assets/eval_aloha.mp4](docs/assets/eval_aloha.mp4) |
+| 评测成功率 | 0% —— 预期结果：5 条数据 152 个 epoch 属重度过拟合，且训练任务（pick_red_cube）与评测任务（AlohaInsertion-v0）语义不同；该结果验证的是**评测管线可运行**，策略性能需更大数据规模 |
 
-### Ray 数据处理服务（ray_worker）
+![wandb l1_loss 曲线](docs/assets/wandb_l1_loss.png)
 
-- 消费 Kafka `raw-data-ingest` 主题。
-- 检测到 `data/scene_metadata.json` 文件时，启动处理流水线：
-  1. 从 MinIO 下载元数据
-  2. 并行调用模型 API 进行场景标注（获取描述、质量分）
-  3. 使用 CLIP 模型生成 512 维文本语义向量
-  4. 生成模拟 256 维轨迹向量（可替换为真实轨迹编码器）
-  5. 批量追加写入 LanceDB
-  6. 批量插入 Zilliz Cloud 向量集合
-  7. 同步结构化数据到 Iceberg
+完整训练日志：[docs/assets/train_aloha.log](docs/assets/train_aloha.log)。
 
-### 模型 API（model_api）
+**env 对齐规则**（错配将在训练或评测阶段报错，均为实测案例）：
 
-- 启动时从 MinIO `models` bucket 下载预训练权重（Faster R-CNN MobileNetV3），缓存到本地 `/models`。
-- `POST /detect`：目标检测（COCO 80 类），返回边界框、置信度、类别。
-- `POST /annotate`：模拟场景标注，返回随机场景描述、mask embedding（256维）和质量评分。
+| 训练数据 | `--env.type` | 说明 |
+|---|---|---|
+| 自采 14 维（aloha） | `aloha` 或 `''` | 相机键/分辨率已对齐 gym_aloha（`observation.images.top`, 480×640），可仿真评测；`''` 只训练不评测 |
+| pusht 2 维 | `pusht` | 官方数据回归验证链路（环境基线） |
 
-> **注意**：当前版本为模拟实现，用于验证数据链路。生产环境可替换为真实的 SAM/VLM 服务。
+两个运维注意：① episode_id 随机生成，**重灌同批包前请先清理旧 episode**
+（`scripts/make_aloha_dataset.sh` 末尾附清理命令）；② 导出应按单一
+本体+来源过滤（混维度/混帧率会被导出端一致性检查拦截，报错信息中含过滤建议）。
 
-### 混合检索 API（api）
+## 实测数据
 
-- `POST /search`：支持结构化过滤（`scene_type`、`quality_min`）和向量检索（`text_query` 语义向量）。
-- 内部流程：先通过 Zilliz Cloud 向量相似搜索获取候选 `scene_id`，再在 Lance 中应用结构化过滤并排序。
+以下数字均在仓库当前代码上实际跑出（运行环境见各出处）：
 
-### Jupyter 交互环境
+| 项目 | 结果 | 出处 |
+|---|---|---|
+| 单元测试 | 76 个用例全部通过（对齐/转换/质检/检索/导出/lerobot-convert） | `pytest tests/ -q` |
+| lerobot-convert 往返 | v2.1 → v3.0 → v2.1：24 episodes / 647 frames，帧数据逐值一致 | `tests/test_lerobot_convert_lib.py` |
+| 灌库吞吐（本地镜像后端） | 60 episodes / 1673 steps，0.29s | `scripts/ingest_public_datasets.py --demo` |
+| 混合检索端到端 | 语义×结构化联合命中、消融对比（仅语义召回 3/5 失败轨迹 → 混合 0/5） | `jupyter/hybrid_search_demo.ipynb`（含实际执行输出） |
+| 训练数据集端到端 | MCAP→灌库→导出→lerobot 加载端全项校验通过（worst diff 5.09e-07，容差 1e-4） | `scripts/verify_lerobot_dataset.py` |
+| AutoDL 训练全链路 | 5 episodes / 1050 frames 自采数据，ACT 20K 步 42 分钟训完，loss 5.54 → 0.06，4 个 eval 节点仿真评测 + 录屏正常产出 | [训练日志](docs/assets/train_aloha.log) / [评测录屏](docs/assets/eval_aloha.mp4) |
 
-- 基于 `jupyter/scipy-notebook`，预装 `boto3`、`pymilvus`、`sentence-transformers`、`lancedb` 等。
-- 可直接连接内网 MinIO、Zilliz Cloud、API 服务，快速原型验证。
+检索延迟等 CI 环境（HashEncoder 降级模式）数字见
+[docs/hybrid_retrieval.md](docs/hybrid_retrieval.md)；生产模式
+（CLIP + Milvus + Iceberg REST）的端到端数字见 Roadmap。
 
-### 监控（Prometheus + Grafana）
+## Reproducibility
 
-- Prometheus 采集 Ray Head、MinIO、Kafka 的指标。
-- Grafana 预置 RobotLoop 面板，展示处理吞吐、存储用量等。
+本文所有数字可通过 `pytest tests/ -q` 与 `jupyter/hybrid_search_demo.ipynb`
+复现。notebook 内的输出为实际执行结果，非手工填写。
 
-## 环境变量
+## Roadmap
 
-复制 `.env.example` 为 `.env`，主要变量说明：
+进行中（README 声称的状态 = 仓库实际状态）：
 
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `S3_ENDPOINT` | MinIO 端点 | `http://minio:9000` |
-| `S3_BUCKET` | 数据 bucket | `robotloop-data` |
-| `S3_ACCESS_KEY` | MinIO access key | `minioadmin` |
-| `S3_SECRET_KEY` | MinIO secret key | `minioadmin` |
-| `MILVUS_URI` | Zilliz Cloud 连接地址 | - |
-| `MILVUS_TOKEN` | Zilliz Cloud API Key | - |
-| `KAFKA_BOOTSTRAP` | Kafka 地址 | `kafka:9092` |
-| `MODEL_API_URL` | 模型 API 地址 | `http://model-api:9002` |
-| `LANCE_PATH` | Lance 数据集路径 | `/tmp/lance` |
-| `ICEBERG_WAREHOUSE` | Iceberg warehouse 路径 | `s3://iceberg-warehouse` |
-| `ICEBERG_TABLE` | Iceberg 表名 | `robotloop.scenes_meta` |
-| `ICEBERG_CATALOG_URI` | Iceberg REST catalog | `http://iceberg-rest:8181` |
-
-## 开发说明
-
-- **代码挂载**：`api`、`device`、`jupyter` 等服务挂载了宿主机目录，修改代码后无需重新构建镜像，直接重启容器即可生效。
-- **添加依赖**：修改对应模块的 `requirements.txt` 后执行 `docker compose build --no-cache <service>`。
-- **清空所有数据重新开始**：`docker compose down -v`。
-- **模型缓存**：模型 API 首次启动时会从 MinIO 下载权重到本地卷，后续重启无需再次下载。
-- **Iceberg 独立 bucket**：Iceberg 数据存储在独立的 `iceberg-warehouse` bucket，避免触发 Kafka 通知循环。
-
-## 技术栈
-
-- **语言**：Python 3.10
-- **流处理**：Apache Kafka (Confluent 7.5)
-- **计算引擎**：Ray 2.9（本地模拟分布式）
-- **存储**：MinIO (S3 兼容)、LanceDB (列式数据湖)、Zilliz Cloud (全托管 Milvus)、Apache Iceberg (结构化数仓)
-- **模型推理**：PyTorch + TorchVision (Faster R-CNN MobileNetV3)，支持 MinIO 模型仓库
-- **监控**：Prometheus + Grafana
-- **容器化**：Docker, Docker Compose
-
-## 已知限制与扩展方向
-
-- **图像/视频处理**：当前版本仅生成模拟图像帧，未实现 NVENC 视频解码、SAM 语义分割、图像 CLIP 编码。生产环境可扩展 GPU Worker 节点处理。
-- **点云处理**：ROS Bag 解析和 PointNet 点云去噪为设计目标，当前版本使用模拟数据占位。
-- **轨迹编码**：使用随机向量模拟，生产环境可替换为真实轨迹编码器（如 TCN、Transformer）。
-- **VLM 场景描述**：当前为 HTTP Mock 服务，生产环境可集成真实的 Qwen-VL、LLaVA 等模型。
+- **ACT × PushT AutoDL 训练录屏** —— 脚本已就绪（`scripts/autodl_act_pusht.sh`），
+  待租卡执行
+- **生产集群端到端数字** —— CLIP + Milvus + Iceberg REST 全链路的检索延迟/吞吐
+- **Open X 真实子集灌库** —— TFDS 依赖独立 Docker 隔离（不污染主环境）
+- **更大规模自采数据训练** —— 当前为 5 条 1050 帧的链路验证规模；
+  扩大数据量后更新评测成功率数字
 
 ## 作者
 
-RobotLoop 数据平台团队 – 技术验证原型
-GitHub: [https://github.com/pftn/robotloop](https://github.com/pftn/robotloop)
+个人独立项目（裸辞期间全职开发）。
+
+GitHub: [@pftn](https://github.com/pftn) ｜ 技术博客: [@pftn](https://www.zhihu.com/people/pftn)
