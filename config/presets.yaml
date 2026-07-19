@@ -1,0 +1,26 @@
+# 灌库预设配置：--preset <name> 读取本文件加载数据集清单
+# 字段说明见 docs/datasets.md
+
+presets:
+  demo:
+    description: 演示与质检验证子集（1000-3000 条 episode 规模）
+    max_episodes_per_source: 300
+    lerobot:
+      - repo_id: lerobot/pusht
+        note: 主力演示数据集，ACT 训练官方配套（206 episodes / 25,650 帧）
+      - repo_id: lerobot/aloha_sim_insertion_human
+        note: 双臂本体多样性（约 50 episodes）
+    openx:
+      # 大小为 GCS 元数据实测（preflight）；超过 10GB 需 --yes 确认
+      - tfds_name: nyu_door_opening_surprising_effectiveness
+        note: stretch 开门（7.65GB / 484 episodes）
+      - tfds_name: berkeley_fanuc_manipulation
+        note: fanuc 工业臂（9.5GB / 415 episodes）
+
+  ci:
+    description: CI 秒级验证（无视频、体积小）
+    max_episodes_per_source: 50
+    lerobot:
+      - repo_id: lerobot/pusht_keypoints
+        note: 仅 2.9MB，无视频
+    openx: []
