@@ -6,3 +6,5 @@ venv
 .idea
 .gitattributes
 .dockerignore
+robotloop.egg-info
+device/sample_bags

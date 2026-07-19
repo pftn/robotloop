@@ -1,5 +1,3 @@
-version: '3.8'
-
 networks:
   robotloop-net:
     driver: bridge
@@ -77,6 +75,7 @@ services:
     environment:
       MC_HOST_minio: http://${S3_ACCESS_KEY:-minioadmin}:${S3_SECRET_KEY:-minioadmin}@minio:9000
       S3_BUCKET: ${S3_BUCKET:-robotloop-data}
+      S3_RAW_BUCKET: ${S3_RAW_BUCKET:-robotloop-raw}
     networks:
       - robotloop-net
     entrypoint: >
@@ -84,11 +83,13 @@ services:
         sleep 15;
         mc ready minio;
         mc mb minio/$${S3_BUCKET} --ignore-existing;
+        mc mb minio/$${S3_RAW_BUCKET} --ignore-existing;
         mc mb minio/models --ignore-existing;
         mc mb minio/iceberg-warehouse --ignore-existing;
         echo 'Buckets created';
-        mc event add minio/$${S3_BUCKET} arn:minio:sqs::robotloop:kafka --event put --ignore-existing;
-        echo 'MinIO notification configured for data bucket only';
+        mc event remove minio/$${S3_BUCKET} arn:minio:sqs::robotloop:kafka --event put || true;
+        mc event add minio/$${S3_RAW_BUCKET} arn:minio:sqs::robotloop:kafka --event put --ignore-existing;
+        echo 'MinIO notification configured for raw bucket only';
         exit 0
       "
 
@@ -162,13 +163,23 @@ services:
       # Iceberg
       - ICEBERG_WAREHOUSE=s3://iceberg-warehouse
       - ICEBERG_TABLE=${ICEBERG_TABLE:-robotloop.scenes_meta}
+      - ICEBERG_EPISODES_TABLE=${ICEBERG_EPISODES_TABLE:-robotloop.episodes}
       - ICEBERG_CATALOG_URI=${ICEBERG_CATALOG_URI:-http://iceberg-rest:8181}
       # Model cache
       - MODEL_CACHE_DIR=/tmp/models
+      # Episode 统一模型包（schema/ingest/quality/retrieval）
+      - PYTHONPATH=/opt/robotloop_pkg
+      # Prometheus 指标端口
+      - METRICS_PORT=9100
+      # HF 镜像（数据集读取走 hf-mirror）
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
     shm_size: '4gb'
     user: "0:0"
+    ports:
+      - "9100:9100" # Prometheus /metrics
     volumes:
       - ./cloud/ray_worker:/app
+      - ./robotloop:/opt/robotloop_pkg/robotloop
       - lance_data:/tmp/lance
     networks:
       - robotloop-net
@@ -242,6 +253,10 @@ services:
       - MILVUS_TOKEN=${MILVUS_TOKEN}
       - LANCE_PATH=${LANCE_PATH:-/tmp/lance}
       - MODEL_CACHE_DIR=/tmp/models
+      # Iceberg REST catalog（/episodes/search 结构化过滤）
+      - ICEBERG_CATALOG_URI=${ICEBERG_CATALOG_URI:-http://iceberg-rest:8181}
+      - ICEBERG_WAREHOUSE=s3://iceberg-warehouse
+      - ICEBERG_EPISODES_TABLE=${ICEBERG_EPISODES_TABLE:-robotloop.episodes}
     volumes:
       - ./cloud/api:/app
       - lance_data:/tmp/lance
@@ -263,7 +278,7 @@ services:
       - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
       - S3_ACCESS_KEY=${S3_ACCESS_KEY}
       - S3_SECRET_KEY=${S3_SECRET_KEY}
-      - S3_BUCKET=${S3_BUCKET:-robotloop-data}
+      - S3_RAW_BUCKET=${S3_RAW_BUCKET:-robotloop-raw}
       - SIMULATE_NETWORK_ISSUES=${SIMULATE_NETWORK_ISSUES:-false}
     depends_on:
       minio-init:
@@ -289,8 +304,13 @@ services:
       - S3_SECRET_KEY=${S3_SECRET_KEY}
       - LANCE_PATH=${LANCE_PATH:-/tmp/lance}
       - MODEL_CACHE_DIR=/tmp/models
+      # 仓库根挂载 + 路径注入（hybrid_search_demo.ipynb 依赖 robotloop 包）
+      - ROBOTLOOP_REPO=/home/jovyan/work/repo
+      - ICEBERG_CATALOG_URI=${ICEBERG_CATALOG_URI:-http://iceberg-rest:8181}
     volumes:
       - ./jupyter/demo.ipynb:/home/jovyan/work/demo.ipynb
+      - ./jupyter/hybrid_search_demo.ipynb:/home/jovyan/work/hybrid_search_demo.ipynb
+      - ./:/home/jovyan/work/repo
       - lance_data:/tmp/lance
     depends_on:
       - minio

@@ -27,6 +27,14 @@ scrape_configs:
         labels:
           component: 'api'
 
+  # Ray Worker 流水线指标（数据吞吐 + 质检过滤统计）
+  - job_name: 'ray-worker'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: [ 'ray-worker:9100' ]
+        labels:
+          component: 'ray-pipeline'
+
   # Kafka Broker（通过 JMX Exporter 或 Kafka Exporter）
   - job_name: 'kafka'
     static_configs:
