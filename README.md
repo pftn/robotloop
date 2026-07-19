@@ -232,3 +232,7 @@ DATASET=/root/lerobot/data/ft_mcap bash run_act.sh
 个人独立项目（裸辞期间全职开发）。
 
 GitHub: [@pftn](https://github.com/pftn) ｜ 技术博客: [@pftn](https://www.zhihu.com/people/pftn)
+
+## License
+
+[MIT](LICENSE)
