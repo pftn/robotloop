@@ -112,7 +112,6 @@ graph LR
   训练后可做仿真评测；PushT 低成本、小时级可复现，用于管线回归。
   GR00T/OpenVLA 接入已预留 modality.json 生成与脚本模板
   （见 `robotloop/export/gr00t.py`）。
-- **Zilliz 免费版先灌子集验证**（运维细节见 [docs/](docs/)）。
 
 ## 快速开始
 
@@ -223,10 +222,6 @@ DATASET=/root/lerobot/data/ft_mcap bash run_act.sh
 
 ## Roadmap
 
-进行中（README 声称的状态 = 仓库实际状态）：
-
-- **ACT × PushT AutoDL 训练录屏** —— 脚本已就绪（`scripts/autodl_act_pusht.sh`），
-  待租卡执行
 - **生产集群端到端数字** —— CLIP + Milvus + Iceberg REST 全链路的检索延迟/吞吐
 - **Open X 真实子集灌库** —— TFDS 依赖独立 Docker 隔离（不污染主环境）
 - **更大规模自采数据训练** —— 当前为 5 条 1050 帧的链路验证规模；
