@@ -1,0 +1,26 @@
+# RobotLoop 数据闭环核心包依赖
+# 核心（必需）
+numpy>=1.26
+pyarrow>=15.0          # LeRobot parquet / Iceberg schema / 本地镜像存储
+pandas>=2.0            # merge_asof 时间对齐
+pyyaml>=6.0            # config/presets.yaml 灌库预设
+Pillow>=10.0           # 视频编码时的图像读取
+imageio>=2.34          # 导出训练数据集时编码 mp4（ACT 等策略要求图像特征）
+imageio-ffmpeg>=0.5    # imageio 的 ffmpeg 后端（libx264）
+
+# CLI 入口（可选安装方式见 pyproject.toml）
+#   robotloop          → robotloop.cli:main
+#   robotloop-convert  → robotloop.convert.cli:main
+
+# ---- 可选依赖（按需安装，代码全部惰性导入）----
+# 语义检索（CLIP）:        sentence-transformers>=2.7
+# MCAP 解析:               mcap>=1.2 mcap-ros2-support>=0.5
+# rosbag2 解析:            rosbags>=0.10
+# Open X / RLDS 加载:      tensorflow_datasets>=4.9
+# LeRobot Hub 下载:        huggingface_hub>=0.24
+# 生产 Iceberg:            pyiceberg[pyarrow]>=0.7
+# 生产向量库:              pymilvus>=2.5
+# API 扩展:                fastapi>=0.110
+
+# 测试
+pytest>=8.0

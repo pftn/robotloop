@@ -14,8 +14,16 @@ lancedb>=0.8.0
 pyarrow>=15.0.0 
 requests==2.31.0
 Pillow==10.0.0
+imageio>=2.34           # 导出训练数据集时编码 mp4（容器内兜底导出路径）
+imageio-ffmpeg>=0.5     # imageio 的 ffmpeg 后端（libx264）；缺它 imageio 会静默降级 tifffile
 torch>=2.1.0
 sentence-transformers>=5.0
 pyiceberg[pyiceberg-core]>=0.6.0
 numpy==1.26.4
 scipy==1.11.4
+# ---- 真实数据入口 / 注册表解析 / 质检 / 监控 ----
+pandas>=2.0.0            # merge_asof 时间对齐
+mcap>=1.1.0              # MCAP 读取（纯 Python，零 ROS 依赖）
+mcap-ros2-support>=0.5.0 # MCAP 内 ROS2 消息解码
+rosbags>=0.10.0          # rosbag2 读取（纯 Python，零 ROS 依赖）
+prometheus-client>=0.19.0 # /metrics 指标出口
