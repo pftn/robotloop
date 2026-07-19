@@ -8,7 +8,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
-S3_BUCKET = os.getenv("S3_BUCKET", "robotloop-data")
+S3_RAW_BUCKET = os.getenv("S3_RAW_BUCKET", "robotloop-raw")
 SOURCE_DIR = "/tmp/robot_data"
 
 s3 = boto3.client(
@@ -28,15 +28,18 @@ def ensure_bucket(bucket):
 
 
 def upload_file(file_path, key):
-    """上传单个文件到 MinIO"""
-    s3_key = f"{key}"
+    """上传单个文件到 MinIO（按类型分层：scenes/ 元数据，scenes/frames/ 图像）"""
+    if key.endswith(".png"):
+        s3_key = f"scenes/frames/{key}"
+    else:
+        s3_key = f"scenes/{key}"
     with open(file_path, "rb") as f:
-        s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=f)
+        s3.put_object(Bucket=S3_RAW_BUCKET, Key=s3_key, Body=f)
     logging.info(f"Uploaded {s3_key}")
 
 
 def main():
-    ensure_bucket(S3_BUCKET)
+    ensure_bucket(S3_RAW_BUCKET)
     manifest_path = os.path.join(SOURCE_DIR, "manifest.json")
     if not os.path.exists(manifest_path):
         logging.error("manifest.json not found, run generator first")
